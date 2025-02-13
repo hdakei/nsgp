@@ -9,8 +9,8 @@
 #include <stdarg.h>
 
 #define BUFFER_SIZE 1024
+#define MAX_CGROUP_LINES 10
 
-/* ProcessInfo structure extended with namespace fields */
 typedef struct {
     char pid[16];
     char app_name[256];
@@ -22,9 +22,12 @@ typedef struct {
     char ns_mnt[128];
     char ns_cgroup[128];
     char ns_time[128];
+    char cgroup_lines[MAX_CGROUP_LINES][BUFFER_SIZE];
+    int cgroup_line_count;
+    int containerized; // 1 if containerized, else 0
+    char container_id[128];
 } ProcessInfo;
 
-/* Check if a string is numeric */
 int is_numeric(const char *str) {
     while (*str) {
         if (!isdigit((unsigned char)*str))
@@ -34,7 +37,6 @@ int is_numeric(const char *str) {
     return 1;
 }
 
-/* Safe snprintf helper */
 int safe_snprintf(char *dest, size_t size, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -45,7 +47,6 @@ int safe_snprintf(char *dest, size_t size, const char *fmt, ...) {
     return ret;
 }
 
-/* Gather process information including namespace details */
 ProcessInfo *gather_process_info(int *count_out) {
     DIR *proc_dir = opendir("/proc");
     if (!proc_dir) {
@@ -72,7 +73,7 @@ ProcessInfo *gather_process_info(int *count_out) {
         memset(&pi, 0, sizeof(pi));
         strncpy(pi.pid, entry->d_name, sizeof(pi.pid)-1);
         
-        /* Read process name from /proc/[pid]/comm */
+        // Read /proc/[pid]/comm for process name
         char comm_path[PATH_MAX];
         if (safe_snprintf(comm_path, sizeof(comm_path), "%s/comm", proc_path) >= 0) {
             FILE *fp = fopen(comm_path, "r");
@@ -86,7 +87,7 @@ ProcessInfo *gather_process_info(int *count_out) {
             }
         }
         
-        /* Initialize namespace fields */
+        // Initialize namespace fields.
         strcpy(pi.ns_net, "-");
         strcpy(pi.ns_uts, "-");
         strcpy(pi.ns_ipc, "-");
@@ -96,7 +97,7 @@ ProcessInfo *gather_process_info(int *count_out) {
         strcpy(pi.ns_cgroup, "-");
         strcpy(pi.ns_time, "-");
         
-        /* Read namespace info from /proc/[pid]/ns */
+        // Read namespace information.
         char ns_dir_path[PATH_MAX];
         if (safe_snprintf(ns_dir_path, sizeof(ns_dir_path), "%s/ns", proc_path) >= 0) {
             DIR *ns_dir = opendir(ns_dir_path);
@@ -134,6 +135,41 @@ ProcessInfo *gather_process_info(int *count_out) {
             }
         }
         
+        // Read cgroup information.
+        char cg_path[PATH_MAX];
+        if (safe_snprintf(cg_path, sizeof(cg_path), "%s/cgroup", proc_path) >= 0) {
+            pi.cgroup_line_count = 0;
+            pi.containerized = 0;
+            FILE *cgfp = fopen(cg_path, "r");
+            if (cgfp) {
+                char line[BUFFER_SIZE];
+                while (fgets(line, sizeof(line), cgfp)) {
+                    if (pi.cgroup_line_count < MAX_CGROUP_LINES) {
+                        strncpy(pi.cgroup_lines[pi.cgroup_line_count], line, BUFFER_SIZE-1);
+                        pi.cgroup_lines[pi.cgroup_line_count][BUFFER_SIZE-1] = '\0';
+                        pi.cgroup_line_count++;
+                    }
+                    // Detect container indicators.
+                    if (strstr(line, "docker") || strstr(line, "lxc") ||
+                        strstr(line, "kubepods") || strstr(line, "container")) {
+                        pi.containerized = 1;
+                        char *docker_ptr = strstr(line, "docker-");
+                        if (docker_ptr && !*pi.container_id) {
+                            char *scope_ptr = strstr(docker_ptr, ".scope");
+                            if (scope_ptr) {
+                                int id_len = scope_ptr - (docker_ptr + 7);
+                                if (id_len > 0 && id_len < (int)sizeof(pi.container_id)) {
+                                    strncpy(pi.container_id, docker_ptr + 7, id_len);
+                                    pi.container_id[id_len] = '\0';
+                                }
+                            }
+                        }
+                    }
+                }
+                fclose(cgfp);
+            }
+        }
+        
         if (count >= capacity) {
             capacity *= 2;
             ProcessInfo *tmp = realloc(processes, capacity * sizeof(ProcessInfo));
@@ -162,7 +198,9 @@ int main(void) {
     
     printf("Found %d processes.\n", procCount);
     for (int i = 0; i < procCount; i++) {
-        printf("PID: %s, Name: %s, ns_net: %s\n", procs[i].pid, procs[i].app_name, procs[i].ns_net);
+        printf("PID: %s, Name: %s, Containerized: %s\n",
+               procs[i].pid, procs[i].app_name,
+               procs[i].containerized ? "Yes" : "No");
     }
     
     free(procs);
