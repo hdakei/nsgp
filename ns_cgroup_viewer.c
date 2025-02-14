@@ -7,6 +7,9 @@
 #include <limits.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <stdarg.h>
 
 #define BUFFER_SIZE 1024
@@ -58,7 +61,7 @@ int safe_snprintf(char *dest, size_t size, const char *fmt, ...) {
     return ret;
 }
 
-ProcessInfo *gather_process_info(int *count_out) {
+ProcessInfo *gather_process_info(int filter, int *count_out) {
     DIR *proc_dir = opendir("/proc");
     if (!proc_dir) {
         perror("opendir /proc");
@@ -180,6 +183,40 @@ ProcessInfo *gather_process_info(int *count_out) {
             }
         }
         
+        /* If containerized, get container details via docker inspect */
+        if (pi.containerized && pi.container_id[0]) {
+            char cmd[256], buf[256];
+            // Container name.
+            snprintf(cmd, sizeof(cmd), "docker inspect --format '{{.Name}}' %s 2>/dev/null", pi.container_id);
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                if (fgets(buf, sizeof(buf), fp)) {
+                    buf[strcspn(buf, "\n")] = '\0';
+                    if (buf[0] == '/')
+                        memmove(buf, buf+1, strlen(buf));
+                    strncpy(pi.container_name, buf, sizeof(pi.container_name)-1);
+                }
+                pclose(fp);
+            }
+            // Container image.
+            snprintf(cmd, sizeof(cmd), "docker inspect --format '{{.Config.Image}}' %s 2>/dev/null", pi.container_id);
+            fp = popen(cmd, "r");
+            if (fp) {
+                if (fgets(buf, sizeof(buf), fp)) {
+                    buf[strcspn(buf, "\n")] = '\0';
+                    strncpy(pi.container_image, buf, sizeof(pi.container_image)-1);
+                }
+                pclose(fp);
+            }
+        }
+        
+        if (filter == 1 && pi.containerized) {
+            continue; // System-only filter: skip containerized
+        }
+        if (filter == 2 && !pi.containerized) {
+            continue; // Container-only filter: skip system processes
+        }
+        
         if (count >= capacity) {
             capacity *= 2;
             ProcessInfo *tmp = realloc(processes, capacity * sizeof(ProcessInfo));
@@ -198,19 +235,98 @@ ProcessInfo *gather_process_info(int *count_out) {
     return processes;
 }
 
+int process_matches(const ProcessInfo *proc, const char *query) {
+    if (!query || !*query) return 1;
+    if (strcasestr(proc->pid, query)) return 1;
+    if (strcasestr(proc->container_name, query)) return 1;
+    if (strcasestr(proc->container_image, query)) return 1;
+    if (strcasestr(proc->app_name, query)) return 1;
+    return 0;
+}
+
+void display_detail_screen(ProcessInfo *proc) {
+    erase();
+    mvprintw(0, 2, "=== Detailed Info for PID: %s ===", proc->pid);
+    
+    int row = 1;
+    mvprintw(row++, 2, "Process Name (comm): %s", proc->app_name);
+    mvprintw(row++, 2, "Namespaces:");
+    mvprintw(row++, 4, "  net:      %s", proc->ns_net);
+    mvprintw(row++, 4, "  uts:      %s", proc->ns_uts);
+    mvprintw(row++, 4, "  ipc:      %s", proc->ns_ipc);
+    mvprintw(row++, 4, "  pid:      %s", proc->ns_pid);
+    mvprintw(row++, 4, "  user:     %s", proc->ns_user);
+    mvprintw(row++, 4, "  mnt:      %s", proc->ns_mnt);
+    mvprintw(row++, 4, "  cgroup:   %s", proc->ns_cgroup);
+    mvprintw(row++, 4, "  time:     %s", proc->ns_time);
+    
+    row++;
+    mvprintw(row++, 2, "Cgroup lines:");
+    for (int i = 0; i < proc->cgroup_line_count; i++) {
+        mvprintw(row++, 4, "%s", proc->cgroup_lines[i]);
+    }
+    row++;
+    if (proc->containerized) {
+        mvprintw(row++, 2, "Containerized: Yes");
+        mvprintw(row++, 4, "Container ID:    %s", proc->container_id);
+        mvprintw(row++, 4, "Container Name:  %s", *proc->container_name ? proc->container_name : "-");
+        mvprintw(row++, 4, "Container Image: %s", *proc->container_image ? proc->container_image : "-");
+        mvprintw(row++, 2, "[n] Enter container namespaces via nsenter | [any key] Return");
+    } else {
+        mvprintw(row++, 2, "Containerized: No");
+        mvprintw(row++, 2, "Press any key to return...");
+    }
+    refresh();
+    
+    int ch = getch();
+    if (proc->containerized && (ch == 'n' || ch == 'N')) {
+        endwin();
+        pid_t parentPgrp = getpgrp();
+        signal(SIGTTOU, SIG_IGN);
+        signal(SIGTTIN, SIG_IGN);
+        pid_t child = fork();
+        if (child == 0) {
+            setenv("TERM", "xterm-256color", 1);
+            execlp("nsenter", "nsenter", "-t", proc->pid, "-a", "/bin/sh", "-i", (char *)NULL);
+            perror("execlp");
+            exit(EXIT_FAILURE);
+        } else if (child > 0) {
+            int status;
+            waitpid(child, &status, 0);
+            tcsetpgrp(STDIN_FILENO, parentPgrp);
+            signal(SIGTTOU, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            system("stty sane");
+            system("clear");
+            system("reset");
+            initscr();
+            noecho();
+            cbreak();
+            keypad(stdscr, TRUE);
+            if (has_colors()) {
+                start_color();
+                init_pair(CP_HEADING,   COLOR_WHITE,  COLOR_BLUE);
+                init_pair(CP_MENU,      COLOR_BLACK,  COLOR_YELLOW);
+                init_pair(CP_NORMAL,    COLOR_WHITE,  COLOR_BLACK);
+                init_pair(CP_CONTAINER, COLOR_YELLOW, COLOR_BLACK);
+                init_pair(CP_SYSTEM,    COLOR_GREEN,  COLOR_BLACK);
+                init_pair(CP_HIGHLIGHT, COLOR_WHITE,  COLOR_RED);
+            }
+        } else {
+            perror("fork");
+        }
+    }
+}
+
 void draw_screen(ProcessInfo *procs, int count, int filter,
                  int start, int selected, const char *search_query) {
     int height, width;
     getmaxyx(stdscr, height, width);
     
-    /* Build filtered index array */
     int *filtered = malloc(count * sizeof(int));
     int filtered_count = 0;
     for (int i = 0; i < count; i++) {
-        /* For now, search filter is applied on some fields */
-        if (search_query == NULL || !*search_query ||
-            strcasestr(procs[i].pid, search_query) ||
-            strcasestr(procs[i].app_name, search_query))
+        if (process_matches(&procs[i], search_query))
             filtered[filtered_count++] = i;
     }
     
@@ -220,7 +336,7 @@ void draw_screen(ProcessInfo *procs, int count, int filter,
     move(0,2);
     clrtoeol();
     attron(A_BOLD | COLOR_PAIR(CP_HEADING));
-    printw("=== NS & Cgroup Viewer === (Total: %d, Filtered: %d)", count, filtered_count);
+    printw("=== NS & Cgroup Viewer (by dhazhir@yahoo.com) === (Total: %d, Filtered: %d)", count, filtered_count);
     attroff(A_BOLD | COLOR_PAIR(CP_HEADING));
     
     move(1,2);
@@ -369,7 +485,7 @@ int main(void) {
         } else if (ch == KEY_DOWN) {
             int local_count = 0;
             for (int i = 0; i < procCount; i++) {
-                if ( (search_query[0] == '\0') || strcasestr(procs[i].pid, search_query) || strcasestr(procs[i].app_name, search_query) )
+                if (process_matches(&procs[i], search_query))
                     local_count++;
             }
             if (selected < local_count - 1) selected++;
@@ -389,7 +505,7 @@ int main(void) {
         } else if (ch == KEY_NPAGE) {
             int local_count = 0;
             for (int i = 0; i < procCount; i++) {
-                if ((search_query[0] == '\0') || strcasestr(procs[i].pid, search_query) || strcasestr(procs[i].app_name, search_query))
+                if (process_matches(&procs[i], search_query))
                     local_count++;
             }
             int height, width;
@@ -404,7 +520,7 @@ int main(void) {
             int local_count = 0;
             int chosen_idx = -1;
             for (int i = 0; i < procCount; i++) {
-                if ((search_query[0] == '\0') || strcasestr(procs[i].pid, search_query) || strcasestr(procs[i].app_name, search_query)) {
+                if (process_matches(&procs[i], search_query)) {
                     if (local_count == selected) {
                         chosen_idx = i;
                         break;
@@ -413,13 +529,7 @@ int main(void) {
                 }
             }
             if (chosen_idx >= 0) {
-                /* Detailed view will be implemented in the next commit */
-                // For now, simply display a placeholder.
-                move(0,0);
-                clrtoeol();
-                printw("Detailed view not implemented in this commit. Press any key...");
-                refresh();
-                getch();
+                display_detail_screen(&procs[chosen_idx]);
             }
         }
     }
