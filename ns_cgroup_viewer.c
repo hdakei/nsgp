@@ -26,6 +26,8 @@ typedef struct {
     int cgroup_line_count;
     int containerized; // 1 if containerized, else 0
     char container_id[128];
+    char container_name[256];
+    char container_image[256];
 } ProcessInfo;
 
 int is_numeric(const char *str) {
@@ -73,7 +75,7 @@ ProcessInfo *gather_process_info(int *count_out) {
         memset(&pi, 0, sizeof(pi));
         strncpy(pi.pid, entry->d_name, sizeof(pi.pid)-1);
         
-        // Read /proc/[pid]/comm for process name
+        /* Read process name */
         char comm_path[PATH_MAX];
         if (safe_snprintf(comm_path, sizeof(comm_path), "%s/comm", proc_path) >= 0) {
             FILE *fp = fopen(comm_path, "r");
@@ -87,7 +89,7 @@ ProcessInfo *gather_process_info(int *count_out) {
             }
         }
         
-        // Initialize namespace fields.
+        /* Initialize namespace fields */
         strcpy(pi.ns_net, "-");
         strcpy(pi.ns_uts, "-");
         strcpy(pi.ns_ipc, "-");
@@ -97,7 +99,7 @@ ProcessInfo *gather_process_info(int *count_out) {
         strcpy(pi.ns_cgroup, "-");
         strcpy(pi.ns_time, "-");
         
-        // Read namespace information.
+        /* Read namespace info */
         char ns_dir_path[PATH_MAX];
         if (safe_snprintf(ns_dir_path, sizeof(ns_dir_path), "%s/ns", proc_path) >= 0) {
             DIR *ns_dir = opendir(ns_dir_path);
@@ -135,7 +137,7 @@ ProcessInfo *gather_process_info(int *count_out) {
             }
         }
         
-        // Read cgroup information.
+        /* Read cgroup information */
         char cg_path[PATH_MAX];
         if (safe_snprintf(cg_path, sizeof(cg_path), "%s/cgroup", proc_path) >= 0) {
             pi.cgroup_line_count = 0;
@@ -149,7 +151,6 @@ ProcessInfo *gather_process_info(int *count_out) {
                         pi.cgroup_lines[pi.cgroup_line_count][BUFFER_SIZE-1] = '\0';
                         pi.cgroup_line_count++;
                     }
-                    // Detect container indicators.
                     if (strstr(line, "docker") || strstr(line, "lxc") ||
                         strstr(line, "kubepods") || strstr(line, "container")) {
                         pi.containerized = 1;
@@ -167,6 +168,33 @@ ProcessInfo *gather_process_info(int *count_out) {
                     }
                 }
                 fclose(cgfp);
+            }
+        }
+        
+        /* If containerized, run docker inspect commands */
+        if (pi.containerized && pi.container_id[0]) {
+            char cmd[256], buf[256];
+            // Get container name.
+            snprintf(cmd, sizeof(cmd), "docker inspect --format '{{.Name}}' %s 2>/dev/null", pi.container_id);
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                if (fgets(buf, sizeof(buf), fp)) {
+                    buf[strcspn(buf, "\n")] = '\0';
+                    if (buf[0] == '/')
+                        memmove(buf, buf+1, strlen(buf));
+                    strncpy(pi.container_name, buf, sizeof(pi.container_name)-1);
+                }
+                pclose(fp);
+            }
+            // Get container image.
+            snprintf(cmd, sizeof(cmd), "docker inspect --format '{{.Config.Image}}' %s 2>/dev/null", pi.container_id);
+            fp = popen(cmd, "r");
+            if (fp) {
+                if (fgets(buf, sizeof(buf), fp)) {
+                    buf[strcspn(buf, "\n")] = '\0';
+                    strncpy(pi.container_image, buf, sizeof(pi.container_image)-1);
+                }
+                pclose(fp);
             }
         }
         
@@ -198,9 +226,15 @@ int main(void) {
     
     printf("Found %d processes.\n", procCount);
     for (int i = 0; i < procCount; i++) {
-        printf("PID: %s, Name: %s, Containerized: %s\n",
+        printf("PID: %s, Name: %s, Containerized: %s\n", 
                procs[i].pid, procs[i].app_name,
                procs[i].containerized ? "Yes" : "No");
+        if (procs[i].containerized) {
+            printf("  Container ID: %s, Name: %s, Image: %s\n", 
+                   procs[i].container_id, 
+                   procs[i].container_name[0] ? procs[i].container_name : "-",
+                   procs[i].container_image[0] ? procs[i].container_image : "-");
+        }
     }
     
     free(procs);
